@@ -13,6 +13,7 @@ import numpy as np
 from fastapi import FastAPI
 from pydantic import BaseModel
 import sys
+import torch
 
 # ==================== PyInstaller 资源路径 ====================
 def get_resource_path(relative_path: str) -> str:
@@ -22,10 +23,10 @@ def get_resource_path(relative_path: str) -> str:
     return os.path.abspath(relative_path)
 from piper.voice import PiperVoice
 import soundfile as sf
-import librosa
-from pydub import AudioSegment
-os.environ["OMP_NUM_THREADS"] = "1"
+from scipy.signal import resample
 
+os.environ["OMP_NUM_THREADS"] = "1"
+torch.set_num_threads(1)
 # =========================================================
 # 数据结构
 # =========================================================
@@ -153,118 +154,94 @@ def load_piper_voice(voice_name: str) -> PiperVoice:
         print_with_timestamp(f"❌ 模型加载失败：{str(e)}")
         raise
 
-def synthesize_with_piper(text: str, voice_name: str, output_wav: str) -> bool:
-    try:
-        voice = load_piper_voice(voice_name)
+def synthesize_to_numpy(text: str, voice_name: str) -> tuple[np.ndarray, int]:
+    voice = load_piper_voice(voice_name)
 
-        text = text.strip()
-        if not text:
-            raise ValueError("空文本无法合成")
+    text = text.strip()
+    if not text:
+        raise ValueError("空文本无法合成")
 
-        sample_rate = voice.config.sample_rate
-        audio_stream = voice.synthesize(text)
+    sample_rate = voice.config.sample_rate
+    audio_stream = voice.synthesize(text)
 
-        chunks = []
+    chunks = []
+    for chunk in audio_stream:
+        if hasattr(chunk, "audio_int16_array") and chunk.audio_int16_array is not None:
+            chunks.append(chunk.audio_int16_array)
 
-        for chunk in audio_stream:
-            # ✅ 正确字段
-            if hasattr(chunk, "audio_int16_array") and chunk.audio_int16_array is not None:
-                chunks.append(chunk.audio_int16_array)
+    if not chunks:
+        raise ValueError("未生成任何音频数据")
 
-        if not chunks:
-            raise ValueError("未生成任何有效音频数据")
+    full_audio = np.concatenate(chunks)
 
-        full_audio = np.concatenate(chunks)
+    return full_audio, sample_rate
 
-        sf.write(
-            output_wav,
-            full_audio,
-            sample_rate,
-            format="WAV",
-            subtype="PCM_16"
-        )
+def change_speed(audio: np.ndarray, rate: float) -> np.ndarray:
+    if rate == 1.0:
+        return audio
 
-        print("✅ 合成成功")
-        return True
-
-    except Exception as e:
-        print("❌ 合成失败:", e)
-        return False
+    new_length = int(len(audio) / rate)
+    indices = np.linspace(0, len(audio) - 1, new_length).astype(np.int32)
+    return audio[indices]
 
 # =========================================================
 # TTS 核心逻辑
 # =========================================================
 def tts_generate(inputs: List[TTSInput], output_dir: str) -> str:
-    print_with_timestamp("进入 TTS 生成阶段，处理文本切分和合成...")
-    print("inputs =", inputs)          # 直接打印
+    print_with_timestamp("进入 TTS 生成阶段...")
+
     if not inputs:
         raise ValueError("输入数据不能为空")
-    
+
     os.makedirs(output_dir, exist_ok=True)
     inputs = sorted(inputs, key=lambda x: x.seq)
-    
-    all_audio_paths = []
+
+    all_audio_arrays = []
     sample_rate = None
 
     for item in inputs:
         voice_name = item.voice.name.lower()
         segments = split_text_for_tts(item.text)
-        
+
         for seg in segments:
             if not seg.strip():
                 continue
-            
-            tmp_wav = os.path.join(output_dir, f"tmp_{uuid.uuid4().hex}.wav")
-            print_with_timestamp(f"调用 Piper 生成语音: {seg[:30]}...")
-            
-            if not synthesize_with_piper(seg, voice_name, tmp_wav):
-                continue
-            
-            # 变速处理
-            if item.voice.rate != 1.0:
-                voice = load_piper_voice(voice_name)
-                y, sr = librosa.load(tmp_wav, sr=voice.config.sample_rate)
-                y_stretched = librosa.effects.time_stretch(y, rate=item.voice.rate)
-                sf.write(tmp_wav, y_stretched, sr, format="WAV", subtype="PCM_16")
+
+            print_with_timestamp(f"合成片段: {seg[:30]}...")
+
+            audio_np, sr = synthesize_to_numpy(seg, voice_name)
+
+            if sample_rate is None:
                 sample_rate = sr
-            elif sample_rate is None:
-                voice = load_piper_voice(voice_name)
-                sample_rate = voice.config.sample_rate
-            
-            all_audio_paths.append(tmp_wav)
-    
-    if not all_audio_paths:
+            elif sample_rate != sr:
+                raise RuntimeError("不同音色采样率不一致")
+
+            # 变速
+            audio_np = change_speed(audio_np, item.voice.rate)
+
+            all_audio_arrays.append(audio_np)
+
+    if not all_audio_arrays:
         raise RuntimeError("未生成任何有效音频")
-    
-    # 拼接音频
-    combined = AudioSegment.empty()
-    for path in all_audio_paths:
-        try:
-            audio = AudioSegment.from_wav(path)
-            combined += audio
-        except Exception as e:
-            print_with_timestamp(f"⚠️ 音频拼接失败 {path}：{str(e)}")
-            continue
-    
-    # 导出最终文件
+
+    # 🔥 直接内存拼接
+    final_audio = np.concatenate(all_audio_arrays)
+
     output_filename = f"tts_mix_{uuid.uuid4().hex}.wav"
     output_path = os.path.join(output_dir, output_filename)
-    combined.export(output_path, format="wav", codec="pcm_s16le")
-    
-    # 清理临时文件
-    for path in all_audio_paths:
-        try:
-            os.remove(path)
-        except:
-            pass
-    
+
+    sf.write(
+        output_path,
+        final_audio,
+        sample_rate,
+        format="WAV",
+        subtype="PCM_16"
+    )
+
     output_path = os.path.abspath(output_path)
     print_with_timestamp(f"最终音频路径: {output_path}")
-    return output_path
 
-def run_tts_locked(inputs, output_dir):
-    with _TTS_LOCK:
-        return tts_generate(inputs, output_dir)
+    return output_path
 
 # =========================================================
 # FastAPI 接口
@@ -326,6 +303,11 @@ async def generate_tts(req: TTSRequest):
         print_with_timestamp(f"❌ TTS 错误：{error_msg}")
         return TTSResponse(success=False, output_path=error_msg)
 
+
+def run_tts_locked(inputs, output_dir):
+    with _TTS_LOCK:
+        return tts_generate(inputs, output_dir)
+    
 if __name__ == "__main__":
     import uvicorn
     print("🚀 Launching Piper TTS HTTP service...")
