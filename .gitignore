@@ -3,15 +3,23 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# 匹配所有以 . 开头的文件
+.*
+# 但是不要忽略 .msc 和 .mv 文件
+!.msc
+!.mv
+*.onnx
+*.onnx.json
+*.DS_Store
 # C extensions
 *.so
 
 # Distribution / packaging
 .Python
-build/
+**/build/
 develop-eggs/
-dist/
-downloads/
+**/dist/**
+**/downloads/**
 eggs/
 .eggs/
 lib/
@@ -25,7 +33,11 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-
+**/output/**
+**/outputs/**
+*.wav
+*.mp3
+**/audio/**
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
