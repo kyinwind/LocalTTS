@@ -14,7 +14,9 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 import sys
 import torch
-
+import torch.multiprocessing as mp
+import gc
+mp.set_start_method("fork", force=True)
 # ==================== PyInstaller 资源路径 ====================
 def get_resource_path(relative_path: str) -> str:
     """获取 PyInstaller 打包后的资源路径"""
@@ -27,6 +29,176 @@ from scipy.signal import resample
 
 os.environ["OMP_NUM_THREADS"] = "1"
 torch.set_num_threads(1)
+
+import re
+import threading
+from typing import List
+
+
+class NovelTTSPreprocessor:
+    """
+    工业级中文小说 TTS 文本预处理器
+    线程安全单例模式
+    """
+
+    _instance = None
+    _lock = threading.Lock()
+
+    # ===============================
+    # 单例入口
+    # ===============================
+    @classmethod
+    def getProcessor(
+        cls,
+        max_segment_length: int = 250,
+        remove_english_parentheses: bool = True,
+        strict_mode: bool = True,
+    ):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls(
+                        max_segment_length,
+                        remove_english_parentheses,
+                        strict_mode,
+                    )
+        return cls._instance
+
+    # ===============================
+    # 初始化
+    # ===============================
+    def __init__(
+        self,
+        max_segment_length: int,
+        remove_english_parentheses: bool,
+        strict_mode: bool,
+    ):
+        self.max_segment_length = max_segment_length
+        self.remove_english_parentheses = remove_english_parentheses
+        self.strict_mode = strict_mode
+
+    # ===============================
+    # 可选：运行时更新配置
+    # ===============================
+    def update_config(
+        self,
+        max_segment_length: int = None,
+        remove_english_parentheses: bool = None,
+        strict_mode: bool = None,
+    ):
+        if max_segment_length is not None:
+            self.max_segment_length = max_segment_length
+        if remove_english_parentheses is not None:
+            self.remove_english_parentheses = remove_english_parentheses
+        if strict_mode is not None:
+            self.strict_mode = strict_mode
+
+    # ===============================
+    # 对外入口
+    # ===============================
+    def process(self, text: str) -> List[str]:
+        text = self._basic_cleanup(text)
+        text = self._normalize_symbols(text)
+        text = self._fix_number_spacing(text)
+        text = self._remove_large_numbers(text)
+
+        if self.remove_english_parentheses:
+            text = self._remove_english_parentheses(text)
+
+        if self.strict_mode:
+            text = self._remove_long_english_blocks(text)
+
+        segments = self._smart_split(text)
+        return [seg.strip() for seg in segments if seg.strip()]
+
+    # ===============================
+    # 基础清理
+    # ===============================
+    def _basic_cleanup(self, text: str) -> str:
+        text = text.strip()
+        text = re.sub(r'[\x00-\x1f\x7f]', '', text)
+        text = re.sub(r'\s+', ' ', text)
+        return text
+
+    # ===============================
+    # 标点归一化
+    # ===============================
+    def _normalize_symbols(self, text: str) -> str:
+        replacements = {
+            "…": "。",
+            "...": "。",
+            "——": "，",
+            "—": "，",
+            "“": "",
+            "”": "",
+            "‘": "",
+            "’": "",
+            "（": "(",
+            "）": ")",
+        }
+        for k, v in replacements.items():
+            text = text.replace(k, v)
+        return text
+
+    # ===============================
+    # 修复数字空格
+    # ===============================
+    def _fix_number_spacing(self, text: str) -> str:
+        return re.sub(r'(\d)\s+(\d)', r'\1\2', text)
+
+    # ===============================
+    # 删除包含英文的括号
+    # ===============================
+    def _remove_english_parentheses(self, text: str) -> str:
+        return re.sub(r'\([^)]*[A-Za-z][^)]*\)', '', text)
+
+    # ===============================
+    # 删除超长英文块
+    # ===============================
+    def _remove_long_english_blocks(self, text: str) -> str:
+        return re.sub(r'[A-Za-z]{15,}', '', text)
+    
+    # ===============================
+    # 删除超长数字（防止 g2p 崩溃）
+    # ===============================
+    def _remove_large_numbers(self, text: str) -> str:
+        # 删除 15 位以上的连续数字
+        text = re.sub(r'\d{15,}', '', text)
+
+        # 删除括号里超长数字（包括有空格的）
+        text = re.sub(r'\([\d\s]{10,}\)', '', text)
+
+        return text
+    # ===============================
+    # 智能分段
+    # ===============================
+    def _smart_split(self, text: str) -> List[str]:
+        sentences = re.split(r'([。！？!?])', text)
+        segments = []
+        current = ""
+
+        for part in sentences:
+            if len(current) + len(part) > self.max_segment_length:
+                if current:
+                    segments.append(current)
+                current = part
+            else:
+                current += part
+
+        if current:
+            segments.append(current)
+
+        # 二次安全切分
+        final_segments = []
+        for seg in segments:
+            if len(seg) <= self.max_segment_length:
+                final_segments.append(seg)
+            else:
+                for i in range(0, len(seg), self.max_segment_length):
+                    final_segments.append(seg[i:i+self.max_segment_length])
+
+        return final_segments
+
 # =========================================================
 # 数据结构
 # =========================================================
@@ -125,6 +297,9 @@ def split_text_for_tts(text: str, min_len: int = 80, max_len: int = 260) -> List
 # Piper 核心调用（完全适配 AudioChunk 官方规范）
 # =========================================================
 def load_piper_voice(voice_name: str) -> PiperVoice:
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
     """加载 Piper 语音模型"""
     if voice_name in VOICE_CACHE:
         return VOICE_CACHE[voice_name]
@@ -173,7 +348,9 @@ def synthesize_to_numpy(text: str, voice_name: str) -> tuple[np.ndarray, int]:
         raise ValueError("未生成任何音频数据")
 
     full_audio = np.concatenate(chunks)
-
+    
+    gc.collect()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
     return full_audio, sample_rate
 
 def change_speed(audio: np.ndarray, rate: float) -> np.ndarray:
@@ -192,6 +369,9 @@ def tts_generate(inputs: List[TTSInput], output_dir: str) -> str:
 
     if not inputs:
         raise ValueError("输入数据不能为空")
+    
+    # 预处理器（适配小说文本，优化 Piper 表现）
+    processor = NovelTTSPreprocessor.getProcessor()
 
     os.makedirs(output_dir, exist_ok=True)
     inputs = sorted(inputs, key=lambda x: x.seq)
@@ -201,7 +381,8 @@ def tts_generate(inputs: List[TTSInput], output_dir: str) -> str:
 
     for item in inputs:
         voice_name = item.voice.name.lower()
-        segments = split_text_for_tts(item.text)
+        #segments = split_text_for_tts(item.text)
+        segments = processor.process(item.text)
 
         for seg in segments:
             if not seg.strip():
