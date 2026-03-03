@@ -19,6 +19,13 @@ from pydantic import BaseModel
 from qwen_tts import Qwen3TTSModel
 
 # =========================================================
+# 工具函数
+# =========================================================
+def print_with_timestamp(message, show_full_datetime=True):
+    fmt = "%Y-%m-%d %H:%M:%S" if show_full_datetime else "%H:%M:%S"
+    print(f"[{datetime.datetime.now().strftime(fmt)}] {message}")
+
+# =========================================================
 # 数据结构
 # =========================================================
 
@@ -326,3 +333,19 @@ async def generate_tts(req: TTSRequest):
     except Exception as e:
         print("❌ TTS error:", e)
         return TTSResponse(success=False, output_path=str(e))
+
+
+def run_tts_locked(inputs, output_dir):
+    with _TTS_LOCK:
+        return tts_generate(inputs, output_dir)
+    
+if __name__ == "__main__":
+    import uvicorn
+    print("🚀 Launching Qwen3 TTS HTTP service...")
+    uvicorn.run(
+        app,                   # 直接传 app 对象
+        host="127.0.0.1",
+        port=8011,
+        reload=False,
+        workers=1
+    )
