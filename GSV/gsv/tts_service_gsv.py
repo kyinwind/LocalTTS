@@ -17,6 +17,7 @@ import io
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from pydub import AudioSegment
 
 # 【新增】导入 gradio_client
 from gradio_client import Client, handle_file
@@ -119,8 +120,8 @@ class VoiceProfileReq(BaseModel):
     ref_text: str
     rate: float = 1.0
     # 【新增】允许用户指定模型路径，如果不填则使用服务端默认/当前加载的
-    gpt_model_path: Optional[str] = None
-    sovits_model_path: Optional[str] = None
+    gpt_model_path: Optional[str] = "GPT_weights_v2/yunyang-e15.ckpt"
+    sovits_model_path: Optional[str] = "SoVITS_weights_v2/yunyang_e8_s392.pth"
 
 class TTSInputReq(BaseModel):
     seq: int
@@ -137,6 +138,8 @@ class TTSResponse(BaseModel):
 
 # =================核心工具函数=================
 
+# =================核心工具函数 (修复版)=================
+
 def call_gs_single_segment_webui(
     text: str, 
     ref_audio: str, 
@@ -149,87 +152,130 @@ def call_gs_single_segment_webui(
 ) -> str:
     """
     [同步版本] 调用 GPT-SoVITS WebUI (Gradio) API 生成音频
-    支持动态切换模型
+    【修复】增加严格的文件校验，确保生成的文件真实存在且大小>0
     """
     if not os.path.exists(ref_audio):
         raise FileNotFoundError(f"参考音频文件不存在: {ref_audio}")
 
+    client = None
     try:
-        # 初始化 Gradio 客户端 (连接一次即可，但为了线程安全，每次调用新建或需加锁，这里简单起见每次新建短连接)
-        # 注意：gradio_client 内部有缓存，多次调用同一 URL 开销不大
-        client = Client(GS_API_ENDPOINT)
+        # 初始化客户端
+        client = Client(GS_API_ENDPOINT, verbose=False) # 关闭 gradio_client 自身的冗长日志
         
-        logger.info(f"📡 正在请求 WebUI API: {GS_API_ENDPOINT}")
+        logger.info(f"📡 请求 WebUI: '{text[:20]}...' (Lang: {lang_code})")
+        
+        # 动态切换模型 (如果有指定)
         if gpt_model:
-            logger.info(f"🔄 切换 GPT 模型: {gpt_model}")
+            logger.debug(f"🔄 切换 GPT: {gpt_model}")
             client.predict(gpt_path=gpt_model, api_name="/change_gpt_weights")
         
         if sovits_model:
-            logger.info(f"🔄 切换 SoVITS 模型: {sovits_model}")
+            logger.debug(f"🔄 切换 SoVITS: {sovits_model}")
             client.predict(sovits_path=sovits_model, prompt_language=lang_code, text_language=lang_code, api_name="/change_sovits_weights")
 
-        # 调用合成接口 /get_tts_wav
-        # 参数映射参考你提供的 API 文档
+        # 调用合成
+        # 注意：how_to_cut 设为 "不切"，因为我们已经在 Python 层切好了
         result = client.predict(
             ref_wav_path=handle_file(ref_audio),
             prompt_text=ref_text,
             prompt_language=lang_code,
             text=text,
             text_language=lang_code,
-            how_to_cut="凑四句一切", # 或者 "不切"，因为我们在外部已经切好了
+            how_to_cut="不切", 
             top_k=15,
             top_p=1.0,
             temperature=1.0,
             ref_free=False,
             speed=rate,
             if_freeze=False,
-            inp_refs=None, # 多参考音频暂不支持，留空
-            sample_steps="32", # 高质量设为 32 或 16
+            inp_refs=None,
+            sample_steps="32",
             if_sr=False,
-            pause_second=0.0, # 外部已分段，这里不需要额外停顿
+            pause_second=0.0,
             api_name="/get_tts_wav"
         )
         
-        # result 通常是一个文件路径字符串 (Gradio 生成的临时文件路径)
-        # 例如：'/tmp/gradio/...'
-        if isinstance(result, str) and os.path.exists(result):
-            # 将 Gradio 生成的临时文件复制到我们指定的 save_path
-            shutil.copy2(result, save_path)
-            logger.info(f"💾 成功保存片段: {save_path}")
-            return save_path
-        else:
-            raise Exception(f"Gradio API 返回无效路径: {result}")
+        # 【关键修复】验证结果
+        if not isinstance(result, str):
+            raise Exception(f"API 返回非字符串类型: {type(result)}")
+            
+        if not os.path.exists(result):
+            raise FileNotFoundError(f"Gradio 返回的文件路径不存在: {result}")
+            
+        file_size = os.path.getsize(result)
+        if file_size == 0:
+            raise Exception(f"Gradio 生成的文件为空 (0 bytes): {result}")
+
+        # 复制到目标路径
+        shutil.copy2(result, save_path)
+        
+        # 再次确认目标文件
+        if not os.path.exists(save_path) or os.path.getsize(save_path) == 0:
+            raise Exception(f"文件复制后验证失败: {save_path}")
+            
+        logger.debug(f"💾 片段成功保存: {os.path.basename(save_path)} ({file_size} bytes)")
+        return save_path
 
     except Exception as e:
-        logger.error(f"❌ WebUI 调用异常: {e}")
+        logger.error(f"❌ 片段生成失败: {e}")
         raise e
+    finally:
+        if client:
+            client.close() # 显式关闭连接释放资源
 
 def merge_audio_files(file_paths: List[str], output_path: str):
-    """合并音频文件"""
+    """
+    合并音频文件
+    【修复】严格检查每个文件，如果有任何一个缺失或为空，直接报错，绝不降级复制第一段
+    """
     if not file_paths:
-        raise ValueError("No audio files to merge")
+        raise ValueError("没有可合并的音频文件列表")
     
-    if len(file_paths) == 1:
-        shutil.copy(file_paths[0], output_path)
+    # 1. 预检查：确保所有文件都存在且有效
+    valid_paths = []
+    for fp in file_paths:
+        if not os.path.exists(fp):
+            raise FileNotFoundError(f"合并失败：片段文件丢失 -> {fp}")
+        if os.path.getsize(fp) == 0:
+            raise ValueError(f"合并失败：片段文件为空 -> {fp}")
+        valid_paths.append(fp)
+
+    if len(valid_paths) == 1:
+        logger.info("🔗 只有一个片段，直接复制")
+        shutil.copy2(valid_paths[0], output_path)
         return
 
+    logger.info(f"🔗 开始合并 {len(valid_paths)} 个片段...")
+    
+    # try:
+    #     from pydub import AudioSegment
+    # except ImportError:
+    #     # 如果没有 pydub，这是一个严重错误，不能简单复制第一段，否则用户会以为合并成功了
+    #     raise ImportError("❌ 合并失败: 缺少 'pydub' 库且片段数 > 1。请运行: pip install pydub ffmpeg-python")
+
     try:
-        from pydub import AudioSegment
         combined = AudioSegment.empty()
-        for fp in file_paths:
-            if not os.path.exists(fp):
-                raise FileNotFoundError(f"Missing segment: {fp}")
+        for i, fp in enumerate(valid_paths):
+            logger.debug(f"   - 加载片段 {i+1}/{len(valid_paths)}: {os.path.basename(fp)}")
             sound = AudioSegment.from_wav(fp)
             combined += sound
         
+        # 统一导出格式
+        logger.debug("   - 正在导出最终文件...")
         combined = combined.set_frame_rate(44100).set_sample_width(2)
         combined.export(output_path, format="wav")
-    except ImportError:
-        logger.warning("⚠️ Warning: pydub not found. Falling back to copying first segment only.")
-        shutil.copy(file_paths[0], output_path)
+        
+        # 最终验证
+        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+            raise Exception("合并后的文件生成失败或为空")
+            
+        logger.info(f"✅ 合并完成: {os.path.basename(output_path)} ({os.path.getsize(output_path)} bytes)")
+        
     except Exception as e:
-        logger.error(f"❌ Merge failed: {e}")
-        shutil.copy(file_paths[0], output_path)
+        logger.error(f"❌ 合并过程发生严重错误: {e}")
+        # 这里不再静默降级，而是直接抛出，让用户知道合并失败了
+        raise Exception(f"音频合并失败: {str(e)}")
+
 
 # =================API 路由=================
 @app.get("/health")
@@ -280,9 +326,9 @@ def generate_tts(request: TTSRequest):
                 logger.info(f"🎤 生成片段 {i+1}/{len(all_segments)}: '{seg['text'][:20]}...'")
                 
                 # 确定语言 (简单判断)
-                lang = "中文"
-                if not any('\u4e00' <= c <= '\u9fff' for c in seg['text']):
-                    lang = "英文" # 简单 fallback，实际可更复杂
+                lang = "中英混合"
+                # if not any('\u4e00' <= c <= '\u9fff' for c in seg['text']):
+                #     lang = "英文" # 简单 fallback，实际可更复杂
 
                 # 【关键】调用新的 WebUI 函数，传入模型路径
                 path = call_gs_single_segment_webui(
