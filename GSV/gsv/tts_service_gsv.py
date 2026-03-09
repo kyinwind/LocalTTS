@@ -48,6 +48,10 @@ _TTS_LOCK = threading.Lock()
 app = FastAPI(title="GPT-SoVITS Bridge Server (WebUI Mode)")
 
 # =================文本预处理逻辑 (保持不变)=================
+import re
+import threading
+from typing import List
+
 class NovelTTSPreprocessor:
     _instance = None
     _lock = threading.Lock()
@@ -60,7 +64,7 @@ class NovelTTSPreprocessor:
                     cls._instance = cls()
         return cls._instance
 
-    def __init__(self, max_segment_length: int = 250):
+    def __init__(self, max_segment_length: int = 35):
         self.max_segment_length = max_segment_length
 
     def process(self, text: str) -> List[str]:
@@ -68,19 +72,25 @@ class NovelTTSPreprocessor:
         text = self._normalize_symbols(text)
         text = self._remove_large_numbers(text)
         segments = self._smart_split(text)
+        # 最后一步清洗，但要注意不要洗掉标点
         return [seg.strip() for seg in segments if seg.strip()]
 
     def _basic_cleanup(self, text: str) -> str:
         text = text.strip()
-        text = re.sub(r'[\x00-\x1f\x7f]', '', text)
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text) # 保留 \t \n \r 如果需要，或者全部去掉
         text = re.sub(r'\s+', ' ', text)
         return text
 
     def _normalize_symbols(self, text: str) -> str:
         replacements = {
-            "…": "。", "...": "。", "——": "，", "—": "，",
-            "“": "", "”": "", "‘": "", "’": "",
-            "（": "(", "）": ")",
+            "…": "……", # 省略号通常保留或转为标准
+            "...": "……", 
+            "——": "，", 
+            "—": "，",
+            "“": "\"", "”": "\"", # 或者保留中文引号，看模型支持
+            "‘": "'", "’": "'",
+            "（": "(", "）": ")", 
+            "○": "零", "〇": "零",
         }
         for k, v in replacements.items():
             text = text.replace(k, v)
@@ -90,28 +100,73 @@ class NovelTTSPreprocessor:
         text = re.sub(r'\d{15,}', '', text)
         text = re.sub(r'\([\d\s]{10,}\)', '', text)
         return text
-
+    
+    def _sanitize_for_gpt_sovits(self, text: str) -> str:
+        text = text.replace("○", "零")
+        text = text.replace("〇", "零")
+        
+        # 【关键修复】不再删除所有标点，只删除真正的乱码或非打印字符
+        # 保留：中文、英文、数字、常见中英文标点
+        # \u3000-\u303F: CJK 标点符号
+        # \uFF00-\uFFEF: 半角及全角形式
+        # 也可以简单写为保留特定标点集合
+        keep_pattern = r"[^\u4e00-\u9fa5a-zA-Z0-9，。！？、；：”“‘’（）《》…—,.!?;:'\"()\[\]\s]"
+        text = re.sub(keep_pattern, "", text)
+        
+        return text
+    
     def _smart_split(self, text: str) -> List[str]:
-        sentences = re.split(r'([。！？!?])', text)
+        # 使用正则分割，保留分隔符
+        # 注意：这里分割后，标点符号会作为单独的元素出现在列表中
+        sentences = re.split(r'([.。！？!?,，])', text)
+        
         segments = []
         current = ""
+        
         for part in sentences:
+            if not part: continue
+            
+            # 如果加上当前部分超过长度限制
             if len(current) + len(part) > self.max_segment_length:
                 if current:
                     segments.append(current)
+                # 关键点：如果 part 是标点，它应该依附于前一句还是作为下一句开头？
+                # TTS 通常希望标点在句尾。
+                # 如果 current 刚被清空，而 part 是标点，我们应该尝试把它加到下一句的开头，
+                # 或者如果标点单独存在且很短，直接忽略（如果不影响语义），
+                # 但最好的策略是：如果 current 满了，把标点留给下一句的开头，或者强制截断。
+                
+                # 简化策略：直接开始新的一句，包含当前 part
                 current = part
             else:
                 current += part
+        
         if current:
             segments.append(current)
+            
         final_segments = []
         for seg in segments:
-            if len(seg) <= self.max_segment_length:
-                final_segments.append(seg)
-            else:
+            seg = seg.strip()
+            if not seg: continue
+            
+            # 如果分段后仍然超长（比如一长串没有标点的文字），强制按长度切分
+            if len(seg) > self.max_segment_length:
+                # 强制切分，尽量不打断单词（中文按字切分即可）
                 for i in range(0, len(seg), self.max_segment_length):
                     final_segments.append(seg[i:i+self.max_segment_length])
-        return final_segments
+            else:
+                final_segments.append(seg)
+        
+        # ✅ 统一清洗
+        clean_segments = []
+        for seg in final_segments:
+            seg = self._sanitize_for_gpt_sovits(seg)
+            seg = seg.strip()
+            # 只有当清洗后还有内容且长度合理时才保留
+            if len(seg) >= 1: 
+                clean_segments.append(seg)
+                
+        return clean_segments
 
 # =================数据模型 (新增模型路径字段)=================
 class VoiceProfileReq(BaseModel):
@@ -323,7 +378,7 @@ def generate_tts(request: TTSRequest):
                 temp_filename = f"{task_id}_s{seg['seq']}_sub{i}.wav"
                 temp_file_path = (TEMP_DIR / temp_filename).resolve()
                 
-                logger.info(f"🎤 生成片段 {i+1}/{len(all_segments)}: '{seg['text'][:20]}...'")
+                logger.info(f"🎤 生成片段 {i+1}/{len(all_segments)}: '{seg['text']}'")
                 
                 # 确定语言 (简单判断)
                 lang = "中英混合"
